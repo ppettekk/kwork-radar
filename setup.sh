@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+#
+# Первичная настройка сервера под Kwork Radar.
+# Ubuntu 22.04 / 24.04, Debian 11 / 12. Запускать от root на чистой машине.
+#
+#   bash setup.sh                 обычная установка
+#   bash setup.sh --dry-run       показать, что будет сделано, ничего не меняя
+#   bash setup.sh --swap 4G       другой размер swap
+#   bash setup.sh --no-swap       не трогать swap
+#   bash setup.sh --dir /srv/app  другой каталог установки
+#
+set -euo pipefail
+
+APP_USER="radar"
+APP_DIR="/opt/kwork-radar"
+SERVICE="kwork-radar"
+SWAP_SIZE="2G"
+MAKE_SWAP=1
+TIMEZONE="Europe/Moscow"
+DRY_RUN=0
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+APP_FILES=(main.py ai.py config.py storage.py requirements.txt profile.md .env.example README.md)
+
+# --------------------------------------------------------------------------- #
+# Утилиты
+# --------------------------------------------------------------------------- #
+C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+
+step() { printf '\n%s>>> %s%s\n' "$C_OK" "$1" "$C_OFF"; }
+info() { printf '    %s\n' "$1"; }
+warn() { printf '%s [!] %s%s\n' "$C_WARN" "$1" "$C_OFF"; }
+die()  { printf '%s [x] %s%s\n' "$C_ERR" "$1" "$C_OFF" >&2; exit 1; }
+
+run() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s    $ %s%s\n' "$C_DIM" "$*" "$C_OFF"
+    else
+        "$@"
+    fi
+}
+
+write_file() {
+    # write_file <путь> <<'EOF' ... EOF
+    local path="$1" content
+    content="$(cat)"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s    $ write %s (%s строк)%s\n' \
+            "$C_DIM" "$path" "$(grep -c '' <<< "$content")" "$C_OFF"
+    else
+        mkdir -p "$(dirname "$path")"
+        printf '%s\n' "$content" > "$path"
+    fi
+}
+
+# --------------------------------------------------------------------------- #
+# Аргументы
+# --------------------------------------------------------------------------- #
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --no-swap) MAKE_SWAP=0; shift ;;
+        --swap)    SWAP_SIZE="$2"; shift 2 ;;
+        --dir)     APP_DIR="$2"; shift 2 ;;
+        --user)    APP_USER="$2"; shift 2 ;;
+        --tz)      TIMEZONE="$2"; shift 2 ;;
+        -h|--help) sed -n '2,12p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        *) die "Неизвестный аргумент: $1" ;;
+    esac
+done
+
+[[ $DRY_RUN -eq 1 || $EUID -eq 0 ]] || die "Запускать от root: sudo bash setup.sh"
+
+for f in main.py requirements.txt .env.example; do
+    [[ -f "$SRC_DIR/$f" ]] || die "Рядом со скриптом нет $f. Положи setup.sh в каталог проекта."
+done
+
+# --------------------------------------------------------------------------- #
+step "Пакеты"
+# --------------------------------------------------------------------------- #
+export DEBIAN_FRONTEND=noninteractive
+run apt-get update -qq
+run apt-get install -y -qq python3 python3-venv python3-pip ca-certificates tzdata
+
+# --------------------------------------------------------------------------- #
+step "Часовой пояс: $TIMEZONE"
+# --------------------------------------------------------------------------- #
+run timedatectl set-timezone "$TIMEZONE" || warn "Не удалось выставить пояс, пропускаю"
+
+# --------------------------------------------------------------------------- #
+step "Swap"
+# --------------------------------------------------------------------------- #
+if [[ $MAKE_SWAP -eq 0 ]]; then
+    info "Пропущено по флагу --no-swap"
+elif [[ -s /proc/swaps ]] && awk 'NR>1{found=1} END{exit !found}' /proc/swaps 2>/dev/null; then
+    info "Swap уже есть, ничего не делаю"
+else
+    info "Создаю /swapfile на $SWAP_SIZE (на 768 МБ RAM без него ловится OOM)"
+    run fallocate -l "$SWAP_SIZE" /swapfile || run dd if=/dev/zero of=/swapfile bs=1M count=2048
+    run chmod 600 /swapfile
+    run mkswap -q /swapfile
+    run swapon /swapfile
+    if [[ $DRY_RUN -eq 0 ]] && ! grep -q '^/swapfile' /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+    run sysctl -q -w vm.swappiness=10
+    write_file /etc/sysctl.d/99-kwork-radar.conf <<'EOF'
+vm.swappiness=10
+EOF
+fi
+
+# --------------------------------------------------------------------------- #
+step "Пользователь $APP_USER"
+# --------------------------------------------------------------------------- #
+if id "$APP_USER" &>/dev/null; then
+    info "Уже существует"
+else
+    run useradd --system --create-home --home-dir "/home/$APP_USER" \
+        --shell /usr/sbin/nologin "$APP_USER"
+fi
+
+# --------------------------------------------------------------------------- #
+step "Файлы в $APP_DIR"
+# --------------------------------------------------------------------------- #
+run mkdir -p "$APP_DIR"
+for f in "${APP_FILES[@]}"; do
+    [[ -f "$SRC_DIR/$f" ]] && run cp "$SRC_DIR/$f" "$APP_DIR/$f"
+done
+run chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+
+# --------------------------------------------------------------------------- #
+step "Виртуальное окружение"
+# --------------------------------------------------------------------------- #
+if [[ ! -d "$APP_DIR/.venv" ]]; then
+    run sudo -u "$APP_USER" python3 -m venv "$APP_DIR/.venv"
+fi
+run sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install --quiet --upgrade pip
+run sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
+
+# --------------------------------------------------------------------------- #
+step "Конфигурация"
+# --------------------------------------------------------------------------- #
+ENV_FILE="$APP_DIR/.env"
+ENV_READY=0
+if [[ -f "$ENV_FILE" ]]; then
+    info ".env уже есть, не перезаписываю"
+    if ! grep -qE '^(KWORK_LOGIN=your_login|TG_BOT_TOKEN=123456:AA|CLOSEROUTER_API_KEY=closerouter_\.\.\.)' "$ENV_FILE"; then
+        ENV_READY=1
+    fi
+else
+    run cp "$APP_DIR/.env.example" "$ENV_FILE"
+    info "Создан из шаблона, заполнить обязательно"
+fi
+run chmod 600 "$ENV_FILE"
+run chown "$APP_USER:$APP_USER" "$ENV_FILE"
+
+# --------------------------------------------------------------------------- #
+step "systemd"
+# --------------------------------------------------------------------------- #
+write_file "/etc/systemd/system/$SERVICE.service" <<EOF
+[Unit]
+Description=Kwork Radar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$APP_USER
+Group=$APP_USER
+WorkingDirectory=$APP_DIR
+ExecStart=$APP_DIR/.venv/bin/python main.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$APP_DIR
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryMax=400M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Диск 5 ГБ, логам столько не нужно.
+write_file /etc/systemd/journald.conf.d/limits.conf <<'EOF'
+[Journal]
+SystemMaxUse=200M
+MaxRetentionSec=2week
+EOF
+
+run systemctl daemon-reload
+run systemctl restart systemd-journald
+run systemctl enable "$SERVICE"
+
+# --------------------------------------------------------------------------- #
+step "Готово"
+# --------------------------------------------------------------------------- #
+PY="$APP_DIR/.venv/bin/python"
+
+if [[ $ENV_READY -eq 1 ]]; then
+    run systemctl restart "$SERVICE"
+    info "Сервис запущен. Логи: journalctl -u $SERVICE -f"
+else
+    warn "Сервис включён в автозапуск, но НЕ стартован: .env не заполнен."
+    cat <<EOF
+
+Что дальше:
+
+  1. Заполнить доступы
+       nano $ENV_FILE
+
+  2. Проверить, что Kwork пускает с этого IP (главный риск на зарубежном хостинге)
+       cd $APP_DIR && sudo -u $APP_USER $PY main.py categories
+
+     Вывалился список рубрик  -> всё хорошо, скопировать нужные ID в CATEGORIES.
+     Ошибка про робота        -> нужен прокси в KWORK_PROXY или другая локация.
+
+  3. Описать себя под промпт отклика
+       nano $APP_DIR/profile.md
+
+  4. Запустить
+       systemctl start $SERVICE
+       journalctl -u $SERVICE -f
+
+EOF
+fi
