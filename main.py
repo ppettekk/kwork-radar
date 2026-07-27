@@ -11,6 +11,7 @@ import html
 import logging
 import re
 import sys
+import time
 from typing import Any
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -26,8 +27,11 @@ from aiogram.types import (
 )
 from kwork import Kwork
 
+from admin import BOT_COMMANDS, Ctx
+from admin import router as admin_router
 from ai import DraftWriter, dashes_to_hyphen
 from config import Settings
+from runtime import Runtime
 from storage import Storage
 
 logging.basicConfig(
@@ -92,24 +96,24 @@ def clean_html(raw: str | None) -> str:
 # --------------------------------------------------------------------------- #
 # Фильтрация
 # --------------------------------------------------------------------------- #
-def passes_filters(project: dict[str, Any], settings: Settings) -> tuple[bool, str]:
+def passes_filters(project: dict[str, Any], rt: Runtime) -> tuple[bool, str]:
     offers = project.get("offers") or 0
-    if offers > settings.max_offers:
-        return False, f"откликов {offers} > {settings.max_offers}"
+    if offers > rt.max_offers:
+        return False, f"откликов {offers} > {rt.max_offers}"
 
     price = project.get("price") or 0
-    if settings.min_price and price < settings.min_price:
-        return False, f"бюджет {price} < {settings.min_price}"
-    if settings.max_price and price > settings.max_price:
-        return False, f"бюджет {price} > {settings.max_price}"
+    if rt.min_price and price < rt.min_price:
+        return False, f"бюджет {price} < {rt.min_price}"
+    if rt.max_price and price > rt.max_price:
+        return False, f"бюджет {price} > {rt.max_price}"
 
     haystack = f"{project.get('title') or ''} {project.get('description') or ''}".lower()
 
-    for word in settings.exclude_keywords:
+    for word in rt.exclude_keywords:
         if word in haystack:
             return False, f"стоп-слово «{word}»"
 
-    if settings.include_keywords and not any(w in haystack for w in settings.include_keywords):
+    if rt.include_keywords and not any(w in haystack for w in rt.include_keywords):
         return False, "нет ни одного ключевого слова"
 
     return True, ""
@@ -196,7 +200,9 @@ async def poll_loop(
     storage: Storage,
     writer: DraftWriter,
     settings: Settings,
+    ctx: Ctx,
 ) -> None:
+    rt = ctx.runtime
     first_run = storage.count() == 0
     if first_run and not settings.notify_on_first_run:
         logger.info("Первый запуск: текущая выдача помечается как просмотренная без уведомлений")
@@ -204,18 +210,27 @@ async def poll_loop(
     failures = 0
 
     while True:
+        if rt.paused:
+            await asyncio.sleep(5)
+            continue
+
         try:
             projects = await kwork.get_projects(
-                categories_ids=settings.categories,
-                price_from=settings.min_price or None,
-                price_to=settings.max_price or None,
-                hiring_from=settings.hiring_from or None,
-                kworks_filter_to=settings.max_offers,
+                categories_ids=rt.categories,
+                price_from=rt.min_price or None,
+                price_to=rt.max_price or None,
+                hiring_from=rt.hiring_from or None,
+                kworks_filter_to=rt.max_offers,
             )
             failures = 0
+            ctx.last_poll = time.monotonic()
+            ctx.last_error = ""
+            storage.incr("polls")
         except Exception as err:
             failures += 1
-            delay = min(settings.poll_interval * failures, 600)
+            delay = min(rt.poll_interval * failures, 600)
+            ctx.last_error = str(err)
+            storage.incr("poll_errors")
             logger.warning("Ошибка опроса биржи (%s). Пауза %s с", err, delay)
             await asyncio.sleep(delay)
             continue
@@ -238,14 +253,19 @@ async def poll_loop(
             if first_run and not settings.notify_on_first_run:
                 continue
 
-            ok, reason = passes_filters(project, settings)
+            ok, reason = passes_filters(project, rt)
             if not ok:
+                storage.incr("filtered")
                 logger.info("Пропуск #%s (%s)", project["id"], reason)
                 continue
 
+            # Переключатели из панели действуют немедленно.
+            writer.enabled = rt.llm_enabled
+            writer.model = rt.llm_model
             draft = await writer.draft(project)
             try:
                 await send_project(bot, settings.tg_chat_id, project, draft)
+                storage.mark_seen(project, notified=True)
                 logger.info(
                     "Отправлен #%s «%s» (%s откликов)",
                     project["id"],
@@ -262,7 +282,7 @@ async def poll_loop(
 
         first_run = False
         storage.purge_older_than(30)
-        await asyncio.sleep(settings.poll_interval)
+        await asyncio.sleep(rt.poll_interval)
 
 
 # --------------------------------------------------------------------------- #
@@ -286,14 +306,17 @@ async def show_categories(settings: Settings) -> None:
 
 async def run(settings: Settings) -> None:
     storage = Storage(settings.db_path)
+    runtime = Runtime(settings, storage)
+    ctx = Ctx(runtime=runtime, storage=storage)
     writer = DraftWriter(
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,
-        model=settings.llm_model,
+        model=runtime.llm_model,
         profile=settings.load_profile(),
-        enabled=settings.llm_enabled,
+        enabled=runtime.llm_enabled,
         repair_dashes=settings.repair_dashes,
         greeting=settings.greeting,
+        stats_hook=storage.incr,
     )
     bot = Bot(
         token=settings.tg_token,
@@ -301,6 +324,7 @@ async def run(settings: Settings) -> None:
     )
     dp = Dispatcher()
     dp.update.outer_middleware(OwnerOnly(settings.tg_chat_id))
+    dp.include_router(admin_router)
 
     @dp.callback_query(F.data.startswith("regen:"))
     async def regenerate(call: CallbackQuery) -> None:
@@ -324,6 +348,7 @@ async def run(settings: Settings) -> None:
         timeout=30.0,
         retry_max_attempts=3,
     ) as kwork:
+        ctx.kwork = kwork
         me = await kwork.get_me()
         connects = await kwork.get_connects()
         logger.info(
@@ -331,13 +356,16 @@ async def run(settings: Settings) -> None:
             me.username,
             connects.active_connects,
             connects.all_connects,
-            len(settings.categories) or "избранные",
-            settings.poll_interval,
+            len(runtime.categories) or "избранные",
+            runtime.poll_interval,
         )
 
-        poller = asyncio.create_task(poll_loop(kwork, bot, storage, writer, settings))
+        await bot.set_my_commands(BOT_COMMANDS)
+        poller = asyncio.create_task(
+            poll_loop(kwork, bot, storage, writer, settings, ctx)
+        )
         try:
-            await dp.start_polling(bot, handle_signals=False)
+            await dp.start_polling(bot, handle_signals=False, ctx=ctx)
         finally:
             poller.cancel()
             await bot.session.close()

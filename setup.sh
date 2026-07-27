@@ -26,7 +26,7 @@ PY_CHECK="import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)"
 DRY_RUN=0
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-APP_FILES=(main.py ai.py config.py storage.py draft_test.py requirements.txt profile.md .env.example README.md)
+APP_FILES=(main.py ai.py config.py storage.py runtime.py admin.py draft_test.py requirements.txt profile.md .env.example README.md)
 
 # --------------------------------------------------------------------------- #
 # Утилиты

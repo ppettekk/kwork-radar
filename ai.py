@@ -148,17 +148,28 @@ class DraftWriter:
         enabled: bool = True,
         repair_dashes: bool = True,
         greeting: str = "Здравствуйте!",
+        stats_hook: Any = None,
     ) -> None:
         self.enabled = enabled
         self.greeting = greeting
         self.model = model
         self.profile = profile
         self.repair_dashes = repair_dashes
+        self.stats_hook = stats_hook
+        # Клиент создаём всегда, когда есть ключ: enabled переключается на лету
+        # из панели бота, пересоздавать соединение ради этого не нужно.
         self._client = (
             AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=45.0)
-            if enabled
+            if api_key
             else None
         )
+
+    def _count(self, event: str) -> None:
+        if self.stats_hook is not None:
+            try:
+                self.stats_hook(event)
+            except Exception:
+                logger.debug("Счётчик %s не записался", event)
 
     def _user_prompt(self, project: dict[str, Any]) -> str:
         # Задача идёт первой: она определяет содержание отклика.
@@ -201,16 +212,19 @@ class DraftWriter:
             )
         except Exception:
             logger.exception("CloseRouter: не удалось сгенерировать отклик")
+            self._count("llm_errors")
             return None
 
         if not raw:
             logger.warning("CloseRouter вернул пустой ответ")
+            self._count("llm_errors")
             return None
         if raw.upper().startswith("SKIP"):
             logger.info(
                 "SKIP: задача вне профиля, черновик не нужен (%s)",
                 (project.get("title") or "")[:60],
             )
+            self._count("skips")
             return None
 
         text = normalize(raw)
@@ -232,4 +246,7 @@ class DraftWriter:
             except Exception:
                 logger.warning("CloseRouter: проход по тире не удался, отдаю как есть")
 
-        return ensure_greeting(text, self.greeting) if text else None
+        if not text:
+            return None
+        self._count("drafts")
+        return ensure_greeting(text, self.greeting)
