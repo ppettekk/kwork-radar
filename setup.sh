@@ -49,6 +49,16 @@ as_user() {
     fi
 }
 
+# /proc/swaps всегда имеет нулевой st_size, поэтому проверять его через -s нельзя:
+# смотрим строки после заголовка.
+has_swap() {
+    awk 'NR > 1 { found = 1 } END { exit !found }' /proc/swaps 2>/dev/null
+}
+
+swap_total() {
+    awk 'NR > 1 { sum += $3 } END { printf "%d МБ", sum / 1024 }' /proc/swaps 2>/dev/null
+}
+
 # Ищет системный интерпретатор не старее PY_MIN.
 detect_python() {
     local candidate found
@@ -154,8 +164,8 @@ step "Swap"
 # --------------------------------------------------------------------------- #
 if [[ $MAKE_SWAP -eq 0 ]]; then
     info "Пропущено по флагу --no-swap"
-elif [[ -s /proc/swaps ]] && awk 'NR>1{found=1} END{exit !found}' /proc/swaps 2>/dev/null; then
-    info "Swap уже есть, ничего не делаю"
+elif has_swap; then
+    info "Swap уже подключён ($(swap_total)), ничего не делаю"
 else
     want_mb=$(to_mb "$SWAP_SIZE")
     avail_mb=$(( $(df --output=avail -k / | tail -1) / 1024 ))
@@ -170,10 +180,20 @@ else
         want_mb=$max_mb
     fi
 
+    # Обрывок от прошлого неудачного запуска мешает fallocate.
+    if (( want_mb > 0 )) && [[ -e /swapfile ]]; then
+        warn "/swapfile уже существует, пробую убрать перед пересозданием"
+        swapoff /swapfile 2>/dev/null || true
+        if ! rm -f /swapfile 2>/dev/null; then
+            warn "Не удалось удалить /swapfile, он занят. Пропускаю шаг."
+            want_mb=0
+        fi
+    fi
+
     if (( want_mb > 0 )); then
         info "Создаю /swapfile на ${want_mb} МБ (на 768 МБ RAM без него ловится OOM)"
         if ! run fallocate -l "${want_mb}M" /swapfile; then
-            run rm -f /swapfile
+            rm -f /swapfile 2>/dev/null || true
             run dd if=/dev/zero of=/swapfile bs=1M count="$want_mb" status=none
         fi
         run chmod 600 /swapfile
