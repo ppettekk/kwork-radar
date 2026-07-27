@@ -18,6 +18,10 @@ SWAP_SIZE="1G"
 DISK_RESERVE_MB=1200        # сколько места на диске оставить системе
 MAKE_SWAP=1
 TIMEZONE="Europe/Moscow"
+PY_MIN="3.12"                 # kwork>=0.2.0 требует минимум эту версию
+PY_TARGET="3.12"              # что ставить, если системный python старее
+UV_BIN="/usr/local/bin/uv"
+PYTHON_DIR="/opt/python"      # общесистемный каталог для интерпретаторов uv
 DRY_RUN=0
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -42,6 +46,36 @@ as_user() {
         run sudo -u "$user" "$@"
     else
         die "Нет ни runuser, ни sudo. Поставь: apt-get install -y util-linux"
+    fi
+}
+
+# Ищет системный интерпретатор не старее PY_MIN.
+detect_python() {
+    local candidate found
+    for candidate in python3.14 python3.13 python3.12 python3; do
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        if "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= tuple(int(x) for x in '$PY_MIN'.split('.')) else 1)" 2>/dev/null; then
+            found="$(command -v "$candidate")"
+            printf '%s' "$found"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Ставит uv одним статическим бинарником, без компиляторов.
+install_uv() {
+    if [[ -x "$UV_BIN" ]]; then
+        info "uv уже установлен"
+        return 0
+    fi
+    run apt-get install -y -qq --no-install-recommends curl
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s    $ curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh%s\n' "$C_DIM" "$C_OFF"
+    else
+        curl -LsSf https://astral.sh/uv/install.sh \
+            | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+        [[ -x "$UV_BIN" ]] || die "uv не установился, проверь доступ в интернет"
     fi
 }
 
@@ -177,11 +211,33 @@ run chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 # --------------------------------------------------------------------------- #
 step "Виртуальное окружение"
 # --------------------------------------------------------------------------- #
-if [[ ! -d "$APP_DIR/.venv" ]]; then
-    as_user "$APP_USER" python3 -m venv "$APP_DIR/.venv"
+PYTHON_BIN="$(detect_python || true)"
+
+if [[ -z "$PYTHON_BIN" ]]; then
+    warn "Системный python3 старее $PY_MIN, ставлю отдельный интерпретатор через uv"
+    install_uv
+    export UV_PYTHON_INSTALL_DIR="$PYTHON_DIR"
+    run "$UV_BIN" python install "$PY_TARGET"
+    if [[ $DRY_RUN -eq 0 ]]; then
+        PYTHON_BIN="$("$UV_BIN" python find "$PY_TARGET")"
+        [[ -x "$PYTHON_BIN" ]] || die "uv не смог подготовить Python $PY_TARGET"
+        # Интерпретатор лежит в /opt, пользователь radar должен его читать.
+        run chmod -R a+rX "$PYTHON_DIR"
+    else
+        PYTHON_BIN="$PYTHON_DIR/cpython-$PY_TARGET/bin/python3"
+    fi
 fi
-as_user "$APP_USER" "$APP_DIR/.venv/bin/pip" install --quiet --upgrade pip
-as_user "$APP_USER" "$APP_DIR/.venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
+
+[[ $DRY_RUN -eq 1 ]] || info "Интерпретатор: $PYTHON_BIN ($("$PYTHON_BIN" -V 2>&1))"
+
+# venv создаём от root, затем отдаём каталог пользователю: так проще с правами
+# на интерпретатор в /opt, чем городить доступы заранее.
+if [[ ! -d "$APP_DIR/.venv" ]]; then
+    run "$PYTHON_BIN" -m venv "$APP_DIR/.venv"
+fi
+run "$APP_DIR/.venv/bin/pip" install --quiet --upgrade pip
+run "$APP_DIR/.venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
+run chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 # --------------------------------------------------------------------------- #
 step "Конфигурация"
