@@ -48,6 +48,11 @@ _SPACED_DASH = re.compile(r"\s+-\s+")
 _LEADING_DASH = re.compile(r"^\s*-\s+", re.MULTILINE)
 
 
+def dashes_to_hyphen(text: str) -> str:
+    """Только замена тире, без чистки markdown: годится для чужого текста."""
+    return text.translate(_DASH_TABLE)
+
+
 def normalize(text: str) -> str:
     """Приводит текст к виду без длинных тире и markdown-разметки."""
     text = text.translate(_DASH_TABLE)
@@ -119,7 +124,14 @@ class DraftWriter:
             logger.exception("CloseRouter: не удалось сгенерировать отклик")
             return None
 
-        if not raw or raw.upper().startswith("SKIP"):
+        if not raw:
+            logger.warning("CloseRouter вернул пустой ответ")
+            return None
+        if raw.upper().startswith("SKIP"):
+            logger.info(
+                "SKIP: задача вне профиля, черновик не нужен (%s)",
+                (project.get("title") or "")[:60],
+            )
             return None
 
         text = normalize(raw)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import sys
 from typing import Any
 
@@ -19,7 +20,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from kwork import Kwork
 
-from ai import DraftWriter
+from ai import DraftWriter, dashes_to_hyphen
 from config import Settings
 from storage import Storage
 
@@ -30,10 +31,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("radar")
 
+_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_BLOCK = re.compile(r"</?(p|div|li|ul|ol|tr|table|h[1-6])[^>]*>", re.IGNORECASE)
+_TAG = re.compile(r"<[^>]+>")
+
 PROJECT_URL = "https://kwork.ru/projects/{id}/view"
 OFFER_URL = "https://kwork.ru/new_offer?project={id}"
 DESCRIPTION_LIMIT = 700
 TG_LIMIT = 3900
+
+
+# --------------------------------------------------------------------------- #
+# Очистка текста
+# --------------------------------------------------------------------------- #
+def clean_html(raw: str | None) -> str:
+    """Kwork отдаёт описания в HTML: теги и сущности вида &mdash; и &times;."""
+    if not raw:
+        return ""
+    text = html.unescape(raw)          # сначала сущности, иначе &lt;br&gt; уцелеет
+    text = _BR.sub("\n", text)
+    text = _BLOCK.sub("\n", text)
+    text = _TAG.sub("", text)
+    text = html.unescape(text)         # второй проход на двойное экранирование
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    # Открывающий и закрывающий теги дают по переносу, в карточке пустые
+    # строки не нужны: схлопываем всё подряд идущее в один перенос.
+    text = re.sub(r"\n[ \t]*\n+", "\n", text)
+    return dashes_to_hyphen(text).strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -172,6 +196,8 @@ async def poll_loop(
             data = item.model_dump()
             if not data.get("id") or storage.is_seen(data["id"]):
                 continue
+            data["title"] = clean_html(data.get("title"))
+            data["description"] = clean_html(data.get("description"))
             fresh.append(data)
 
         # От старых к новым, чтобы порядок в чате был хронологическим.
