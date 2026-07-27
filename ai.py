@@ -12,9 +12,12 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """Ты пишешь отклики на заказы биржи Kwork от лица исполнителя.
 
+ПЕРВОЕ И ОБЯЗАТЕЛЬНОЕ: отклик начинается со слова «Здравствуйте!».
+Без него ответ считается неправильным. Дальше сразу по делу.
+
 СТРУКТУРА ОТКЛИКА
 
-1. Первое слово: «Здравствуйте!» Дальше сразу по делу, без «меня зовут».
+1. Приветствие «Здравствуйте!», затем сразу суть, без «меня зовут».
 2. Одна фраза, показывающая, что ТЗ прочитано: своими словами, что нужно
    сделать. Не пересказывай задание целиком, заказчик его и так знает.
 3. Ядро отклика: КАК ты это сделаешь. Конкретные шаги, инструменты, на что
@@ -101,8 +104,19 @@ REPAIR_PROMPT = (
 _DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\u2043\uFE58\uFE63\uFF0D"
 _DASH_TABLE = {ord(ch): "-" for ch in _DASHES}
 
+_GREETING = re.compile(
+    r"^\W*(здравствуй|добрый\s+(день|вечер)|доброе\s+утро|доброго|приветствую|привет|салют|хай)",
+    re.IGNORECASE,
+)
 _SPACED_DASH = re.compile(r"\s+-\s+")
 _LEADING_DASH = re.compile(r"^\s*-\s+", re.MULTILINE)
+
+
+def ensure_greeting(text: str, greeting: str) -> str:
+    """Модель регулярно забывает поздороваться, поэтому проверяем сами."""
+    if not greeting or _GREETING.match(text):
+        return text
+    return f"{greeting} {text.lstrip()}"
 
 
 def dashes_to_hyphen(text: str) -> str:
@@ -133,8 +147,10 @@ class DraftWriter:
         profile: str = "",
         enabled: bool = True,
         repair_dashes: bool = True,
+        greeting: str = "Здравствуйте!",
     ) -> None:
         self.enabled = enabled
+        self.greeting = greeting
         self.model = model
         self.profile = profile
         self.repair_dashes = repair_dashes
@@ -216,4 +232,4 @@ class DraftWriter:
             except Exception:
                 logger.warning("CloseRouter: проход по тире не удался, отдаю как есть")
 
-        return text or None
+        return ensure_greeting(text, self.greeting) if text else None

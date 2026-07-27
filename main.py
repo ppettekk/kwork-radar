@@ -264,6 +264,7 @@ async def run(settings: Settings) -> None:
         profile=settings.load_profile(),
         enabled=settings.llm_enabled,
         repair_dashes=settings.repair_dashes,
+        greeting=settings.greeting,
     )
     bot = Bot(
         token=settings.tg_token,
