@@ -13,11 +13,17 @@ import re
 import sys
 from typing import Any
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    TelegramObject,
+    Update,
+)
 from kwork import Kwork
 
 from ai import DraftWriter, dashes_to_hyphen
@@ -39,6 +45,29 @@ PROJECT_URL = "https://kwork.ru/projects/{id}/view"
 OFFER_URL = "https://kwork.ru/new_offer?project={id}"
 DESCRIPTION_LIMIT = 700
 TG_LIMIT = 3900
+
+
+# --------------------------------------------------------------------------- #
+# Доступ
+# --------------------------------------------------------------------------- #
+class OwnerOnly(BaseMiddleware):
+    """Бот виден в поиске Telegram всем, поэтому чужие апдейты режем на входе."""
+
+    def __init__(self, owner_id: int) -> None:
+        self.owner_id = owner_id
+
+    async def __call__(self, handler, event: TelegramObject, data: dict) -> Any:
+        user = data.get("event_from_user")
+        if user is not None and user.id != self.owner_id:
+            logger.warning(
+                "Чужой апдейт отброшен: id=%s username=%s",
+                user.id,
+                user.username,
+            )
+            if isinstance(event, Update) and event.callback_query:
+                await event.callback_query.answer("Нет доступа", show_alert=True)
+            return None
+        return await handler(event, data)
 
 
 # --------------------------------------------------------------------------- #
@@ -271,6 +300,7 @@ async def run(settings: Settings) -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
+    dp.update.outer_middleware(OwnerOnly(settings.tg_chat_id))
 
     @dp.callback_query(F.data.startswith("regen:"))
     async def regenerate(call: CallbackQuery) -> None:
