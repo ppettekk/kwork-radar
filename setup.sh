@@ -22,6 +22,7 @@ PY_MIN="3.12"                 # kwork>=0.2.0 требует минимум эт�
 PY_TARGET="3.12"              # что ставить, если системный python старее
 UV_BIN="/usr/local/bin/uv"
 PYTHON_DIR="/opt/python"      # общесистемный каталог для интерпретаторов uv
+PY_CHECK="import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)"
 DRY_RUN=0
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -64,7 +65,7 @@ detect_python() {
     local candidate found
     for candidate in python3.14 python3.13 python3.12 python3; do
         command -v "$candidate" >/dev/null 2>&1 || continue
-        if "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= tuple(int(x) for x in '$PY_MIN'.split('.')) else 1)" 2>/dev/null; then
+        if "$candidate" -c "$PY_CHECK" 2>/dev/null; then
             found="$(command -v "$candidate")"
             printf '%s' "$found"
             return 0
@@ -249,6 +250,15 @@ if [[ -z "$PYTHON_BIN" ]]; then
 fi
 
 [[ $DRY_RUN -eq 1 ]] || info "Интерпретатор: $PYTHON_BIN ($("$PYTHON_BIN" -V 2>&1))"
+
+# Окружение могло остаться от прошлого запуска, собранное на старом Python.
+# Тогда его pip продолжит отказываться ставить пакеты и без пересоздания не обойтись.
+if [[ -d "$APP_DIR/.venv" && $DRY_RUN -eq 0 ]]; then
+    if ! "$APP_DIR/.venv/bin/python" -c "$PY_CHECK" 2>/dev/null; then
+        warn "Существующее .venv собрано на Python старее $PY_MIN, пересоздаю"
+        rm -rf "$APP_DIR/.venv"
+    fi
+fi
 
 # venv создаём от root, затем отдаём каталог пользователю: так проще с правами
 # на интерпретатор в /opt, чем городить доступы заранее.
