@@ -14,7 +14,8 @@ set -euo pipefail
 APP_USER="radar"
 APP_DIR="/opt/kwork-radar"
 SERVICE="kwork-radar"
-SWAP_SIZE="2G"
+SWAP_SIZE="1G"
+DISK_RESERVE_MB=1200        # сколько места на диске оставить системе
 MAKE_SWAP=1
 TIMEZONE="Europe/Moscow"
 DRY_RUN=0
@@ -31,6 +32,27 @@ step() { printf '\n%s>>> %s%s\n' "$C_OK" "$1" "$C_OFF"; }
 info() { printf '    %s\n' "$1"; }
 warn() { printf '%s [!] %s%s\n' "$C_WARN" "$1" "$C_OFF"; }
 die()  { printf '%s [x] %s%s\n' "$C_ERR" "$1" "$C_OFF" >&2; exit 1; }
+
+# В минимальном Debian нет sudo, поэтому предпочитаем runuser из util-linux.
+as_user() {
+    local user="$1"; shift
+    if command -v runuser >/dev/null 2>&1; then
+        run runuser -u "$user" -- "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        run sudo -u "$user" "$@"
+    else
+        die "Нет ни runuser, ни sudo. Поставь: apt-get install -y util-linux"
+    fi
+}
+
+to_mb() {
+    local s="${1^^}"
+    case "$s" in
+        *G) echo $(( ${s%G} * 1024 )) ;;
+        *M) echo "${s%M}" ;;
+        *)  echo "$s" ;;
+    esac
+}
 
 run() {
     if [[ $DRY_RUN -eq 1 ]]; then
@@ -79,8 +101,14 @@ done
 step "Пакеты"
 # --------------------------------------------------------------------------- #
 export DEBIAN_FRONTEND=noninteractive
+# --no-install-recommends обязателен: иначе python3-pip тянет build-essential,
+# gcc и python3-dev, а это плюс полтора гигабайта на диске в 5 ГБ.
+# Системный pip не нужен, внутри venv он появляется через ensurepip.
 run apt-get update -qq
-run apt-get install -y -qq python3 python3-venv python3-pip ca-certificates tzdata
+run apt-get install -y -qq --no-install-recommends \
+    python3 python3-venv ca-certificates tzdata
+run apt-get clean
+info "Свободно на /: $(df -h --output=avail / | tail -1 | tr -d ' ')"
 
 # --------------------------------------------------------------------------- #
 step "Часовой пояс: $TIMEZONE"
@@ -95,18 +123,36 @@ if [[ $MAKE_SWAP -eq 0 ]]; then
 elif [[ -s /proc/swaps ]] && awk 'NR>1{found=1} END{exit !found}' /proc/swaps 2>/dev/null; then
     info "Swap уже есть, ничего не делаю"
 else
-    info "Создаю /swapfile на $SWAP_SIZE (на 768 МБ RAM без него ловится OOM)"
-    run fallocate -l "$SWAP_SIZE" /swapfile || run dd if=/dev/zero of=/swapfile bs=1M count=2048
-    run chmod 600 /swapfile
-    run mkswap -q /swapfile
-    run swapon /swapfile
-    if [[ $DRY_RUN -eq 0 ]] && ! grep -q '^/swapfile' /etc/fstab; then
-        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    want_mb=$(to_mb "$SWAP_SIZE")
+    avail_mb=$(( $(df --output=avail -k / | tail -1) / 1024 ))
+    max_mb=$(( avail_mb - DISK_RESERVE_MB ))
+
+    if (( max_mb < 256 )); then
+        warn "Свободно ${avail_mb} МБ, на swap не хватает. Пропускаю."
+        warn "Освободи место (apt-get clean, apt-get autoremove --purge) и запусти снова."
+        want_mb=0
+    elif (( want_mb > max_mb )); then
+        info "Свободно ${avail_mb} МБ, уменьшаю swap с ${want_mb} до ${max_mb} МБ"
+        want_mb=$max_mb
     fi
-    run sysctl -q -w vm.swappiness=10
-    write_file /etc/sysctl.d/99-kwork-radar.conf <<'EOF'
+
+    if (( want_mb > 0 )); then
+        info "Создаю /swapfile на ${want_mb} МБ (на 768 МБ RAM без него ловится OOM)"
+        if ! run fallocate -l "${want_mb}M" /swapfile; then
+            run rm -f /swapfile
+            run dd if=/dev/zero of=/swapfile bs=1M count="$want_mb" status=none
+        fi
+        run chmod 600 /swapfile
+        run mkswap -q /swapfile
+        run swapon /swapfile
+        if [[ $DRY_RUN -eq 0 ]] && ! grep -q '^/swapfile' /etc/fstab; then
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+        run sysctl -q -w vm.swappiness=10
+        write_file /etc/sysctl.d/99-kwork-radar.conf <<'EOF'
 vm.swappiness=10
 EOF
+    fi
 fi
 
 # --------------------------------------------------------------------------- #
@@ -132,10 +178,10 @@ run chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 step "Виртуальное окружение"
 # --------------------------------------------------------------------------- #
 if [[ ! -d "$APP_DIR/.venv" ]]; then
-    run sudo -u "$APP_USER" python3 -m venv "$APP_DIR/.venv"
+    as_user "$APP_USER" python3 -m venv "$APP_DIR/.venv"
 fi
-run sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install --quiet --upgrade pip
-run sudo -u "$APP_USER" "$APP_DIR/.venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
+as_user "$APP_USER" "$APP_DIR/.venv/bin/pip" install --quiet --upgrade pip
+as_user "$APP_USER" "$APP_DIR/.venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
 
 # --------------------------------------------------------------------------- #
 step "Конфигурация"
@@ -217,7 +263,7 @@ else
        nano $ENV_FILE
 
   2. Проверить, что Kwork пускает с этого IP (главный риск на зарубежном хостинге)
-       cd $APP_DIR && sudo -u $APP_USER $PY main.py categories
+       cd $APP_DIR && runuser -u $APP_USER -- $PY main.py categories
 
      Вывалился список рубрик  -> всё хорошо, скопировать нужные ID в CATEGORIES.
      Ошибка про робота        -> нужен прокси в KWORK_PROXY или другая локация.
