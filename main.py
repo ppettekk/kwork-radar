@@ -329,7 +329,10 @@ async def run(settings: Settings) -> None:
         repair_dashes=settings.repair_dashes,
         greeting=settings.greeting,
         stats_hook=storage.incr,
+        timeout=settings.llm_timeout,
+        retries=settings.llm_retries,
     )
+    ctx.writer = writer
     bot = Bot(
         token=settings.tg_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -361,8 +364,9 @@ async def run(settings: Settings) -> None:
         # Первый черновик ровным тоном, повторные разнообразнее.
         draft = await writer.draft(project, temperature=0.7 if first else 0.95)
         if not draft:
+            reason = writer.last_error or "модель вернула пустой ответ"
             await call.message.answer(
-                "Не получилось сгенерировать. Проверьте модель и ключ в панели."
+                f"Не получилось сгенерировать.\n<i>{html.escape(reason)}</i>"
             )
             return
 

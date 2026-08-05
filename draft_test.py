@@ -59,6 +59,8 @@ async def main() -> None:
     print(f"МОДЕЛЬ:    {settings.llm_model}")
     print(f"ПРИВЕТСТВИЕ: {settings.greeting or 'выключено'}")
     print(f"ПРОМПТ:    {len(SYSTEM_PROMPT)} символов")
+    print(f"ЭНДПОИНТ:  {settings.llm_base_url}")
+    print(f"ТАЙМАУТ:   {settings.llm_timeout} с, повторов {settings.llm_retries}")
     print(f"ПРОФИЛЬ:   {len(profile)} символов из {settings.profile_path}")
     print("=" * 70)
     print(f"ЗАДАЧА: {project.get('title')}")
@@ -74,13 +76,15 @@ async def main() -> None:
         enabled=True,
         repair_dashes=settings.repair_dashes,
         greeting=settings.greeting,
+        timeout=settings.llm_timeout,
+        retries=settings.llm_retries,
     )
 
     for i in range(args.n):
         draft = await writer.draft(project, temperature=0.7 + 0.15 * i)
         print(f"\n--- ВАРИАНТ {i + 1} ---")
         if draft is None:
-            print("(пусто: SKIP или ошибка, смотри сообщения выше)")
+            print(f"(пусто: {writer.last_error or 'SKIP, задача вне профиля'})")
             continue
         print(draft)
         checks = {

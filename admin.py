@@ -40,6 +40,7 @@ class Edit(StatesGroup):
 class Ctx:
     runtime: Runtime
     storage: Storage
+    writer: Any = None
     started_at: float = field(default_factory=time.monotonic)
     kwork: Any = None
     last_poll: float = 0.0
@@ -130,6 +131,8 @@ async def stats_screen(ctx: Ctx) -> Screen:
         lines.append(f"Пропущено как SKIP: {c['skips']}")
     if c.get("llm_errors"):
         lines.append(f"Ошибок ИИ: {c['llm_errors']}")
+    if ctx.writer is not None and getattr(ctx.writer, "last_error", ""):
+        lines.append(f"Последняя: <i>{html.escape(ctx.writer.last_error[:120])}</i>")
 
     if ctx.kwork is not None:
         try:

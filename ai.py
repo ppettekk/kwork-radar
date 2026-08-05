@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +184,8 @@ class DraftWriter:
         repair_dashes: bool = True,
         greeting: str = "Здравствуйте!",
         stats_hook: Any = None,
+        timeout: float = 90.0,
+        retries: int = 2,
     ) -> None:
         self.enabled = enabled
         self.greeting = greeting
@@ -184,10 +193,19 @@ class DraftWriter:
         self.profile = profile
         self.repair_dashes = repair_dashes
         self.stats_hook = stats_hook
+        self.last_error = ""
         # Клиент создаём всегда, когда есть ключ: enabled переключается на лету
         # из панели бота, пересоздавать соединение ради этого не нужно.
+        self.base_url = base_url
+        self.timeout = timeout
+        self.retries = retries
         self._client = (
-            AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=45.0)
+            AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=0,          # повторы делаем сами, с логом и паузой
+            )
             if api_key
             else None
         )
@@ -222,13 +240,53 @@ class DraftWriter:
         return "\n\n".join(parts)
 
     async def _complete(self, messages: list[dict[str, str]], temperature: float) -> str:
-        response = await self._client.chat.completions.create(
-            model=self.model,
-            max_tokens=600,
-            temperature=temperature,
-            messages=messages,
-        )
-        return (response.choices[0].message.content or "").strip()
+        last: Exception | None = None
+
+        for attempt in range(1, self.retries + 2):
+            started = time.monotonic()
+            try:
+                response = await self._client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=600,
+                    temperature=temperature,
+                    messages=messages,
+                )
+            except APITimeoutError as err:
+                last = err
+                logger.warning(
+                    "Попытка %s из %s: модель %s не ответила за %.0f с",
+                    attempt,
+                    self.retries + 1,
+                    self.model,
+                    self.timeout,
+                )
+            except APIConnectionError as err:
+                last = err
+                logger.warning(
+                    "Попытка %s из %s: нет связи с %s (%s)",
+                    attempt,
+                    self.retries + 1,
+                    self.base_url,
+                    err.__class__.__name__,
+                )
+            except APIStatusError as err:
+                # Ключ, лимиты и опечатка в модели повтором не лечатся.
+                logger.error(
+                    "CloseRouter ответил %s: %s",
+                    err.status_code,
+                    str(err)[:200],
+                )
+                raise
+            else:
+                logger.info(
+                    "Ответ от %s за %.1f с", self.model, time.monotonic() - started
+                )
+                return (response.choices[0].message.content or "").strip()
+
+            if attempt <= self.retries:
+                await asyncio.sleep(2 * attempt)
+
+        raise last  # type: ignore[misc]
 
     async def draft(self, project: dict[str, Any], temperature: float = 0.7) -> str | None:
         if not self.enabled or self._client is None:
@@ -242,9 +300,18 @@ class DraftWriter:
                 ],
                 temperature,
             )
-        except Exception:
-            logger.exception("CloseRouter: не удалось сгенерировать отклик")
+        except APIStatusError as err:
             self._count("llm_errors")
+            self.last_error = f"HTTP {err.status_code}: {str(err)[:120]}"
+            return None
+        except Exception as err:
+            logger.error(
+                "Не удалось сгенерировать отклик: %s. Проверьте CLOSEROUTER_BASE_URL, "
+                "ключ и доступность сервиса с этого сервера.",
+                err.__class__.__name__,
+            )
+            self._count("llm_errors")
+            self.last_error = f"{err.__class__.__name__} при обращении к {self.base_url}"
             return None
 
         if not raw:
