@@ -12,12 +12,13 @@ import logging
 import re
 import sys
 import time
+from contextlib import suppress
 from typing import Any
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -159,17 +160,20 @@ def format_card(project: dict[str, Any]) -> str:
     return text[:TG_LIMIT]
 
 
-def build_keyboard(project_id: int, has_draft: bool) -> InlineKeyboardMarkup:
+def build_keyboard(project_id: int, has_draft: bool, llm_ready: bool) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(text="📄 Проект", url=PROJECT_URL.format(id=project_id)),
             InlineKeyboardButton(text="✍️ Откликнуться", url=OFFER_URL.format(id=project_id)),
         ]
     ]
-    if has_draft:
-        rows.append(
-            [InlineKeyboardButton(text="♻️ Другой вариант", callback_data=f"regen:{project_id}")]
-        )
+    if llm_ready:
+        rows.append([
+            InlineKeyboardButton(
+                text="♻️ Другой вариант" if has_draft else "🪄 Сгенерировать отклик",
+                callback_data=f"regen:{project_id}",
+            )
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -178,12 +182,13 @@ async def send_project(
     chat_id: int,
     project: dict[str, Any],
     draft: str | None,
+    llm_ready: bool = True,
 ) -> None:
     project_id = project["id"]
     await bot.send_message(
         chat_id,
         format_card(project),
-        reply_markup=build_keyboard(project_id, draft is not None),
+        reply_markup=build_keyboard(project_id, draft is not None, llm_ready),
         disable_web_page_preview=True,
     )
     if draft:
@@ -262,9 +267,14 @@ async def poll_loop(
             # Переключатели из панели действуют немедленно.
             writer.enabled = rt.llm_enabled
             writer.model = rt.llm_model
-            draft = await writer.draft(project)
+            llm_ready = rt.llm_enabled and writer.has_client
+            # Без auto_draft черновик ждёт кнопки: так модель не тратится
+            # на проекты, которые всё равно пролистываешь.
+            draft = await writer.draft(project) if (llm_ready and rt.auto_draft) else None
             try:
-                await send_project(bot, settings.tg_chat_id, project, draft)
+                await send_project(
+                    bot, settings.tg_chat_id, project, draft, llm_ready
+                )
                 storage.mark_seen(project, notified=True)
                 logger.info(
                     "Отправлен #%s «%s» (%s откликов)",
@@ -274,7 +284,9 @@ async def poll_loop(
                 )
             except TelegramRetryAfter as err:
                 await asyncio.sleep(err.retry_after + 1)
-                await send_project(bot, settings.tg_chat_id, project, draft)
+                await send_project(
+                    bot, settings.tg_chat_id, project, draft, llm_ready
+                )
             except Exception:
                 logger.exception("Не удалось отправить #%s", project["id"])
 
@@ -333,12 +345,33 @@ async def run(settings: Settings) -> None:
         if not project:
             await call.answer("Проект не найден в базе", show_alert=True)
             return
-        await call.answer("Генерирую…")
-        draft = await writer.draft(project, temperature=0.95)
-        if not draft:
-            await call.message.answer("Не получилось сгенерировать вариант")
+        if not runtime.llm_enabled:
+            await call.answer("Черновики выключены в панели", show_alert=True)
             return
+
+        first = call.message.reply_markup and any(
+            b.text.startswith("🪄")
+            for row in call.message.reply_markup.inline_keyboard
+            for b in row
+        )
+        await call.answer("Генерирую…")
+
+        writer.enabled = True
+        writer.model = runtime.llm_model
+        # Первый черновик ровным тоном, повторные разнообразнее.
+        draft = await writer.draft(project, temperature=0.7 if first else 0.95)
+        if not draft:
+            await call.message.answer(
+                "Не получилось сгенерировать. Проверьте модель и ключ в панели."
+            )
+            return
+
         await call.message.answer(f"<code>{html.escape(draft)}</code>")
+        if first:
+            with suppress(TelegramBadRequest):
+                await call.message.edit_reply_markup(
+                    reply_markup=build_keyboard(project_id, True, True)
+                )
 
     async with Kwork(
         login=settings.kwork_login,

@@ -77,7 +77,8 @@ def menu_screen(ctx: Ctx) -> Screen:
     text = (
         f"{'⏸' if rt.paused else '▶️'} <b>Kwork Radar: "
         f"{'на паузе' if rt.paused else 'работает'}</b>\n\n"
-        f"Черновики ИИ: {'включены' if rt.llm_enabled else 'выключены'}\n"
+        f"Черновики ИИ: {'включены' if rt.llm_enabled else 'выключены'}"
+        f"{', сразу с проектом' if rt.auto_draft else ', по кнопке'}\n"
         f"Опрос каждые {rt.poll_interval} с, последний {ago}\n"
         f"Фильтр: до {rt.max_offers} откликов, бюджет от {rt.min_price or 0} ₽\n"
         f"Рубрики: {show('categories', rt.categories)}"
@@ -90,6 +91,10 @@ def menu_screen(ctx: Ctx) -> Screen:
             btn("▶️ Продолжить" if rt.paused else "⏸ Пауза", "adm:t:paused"),
             btn("🤖 ИИ выкл" if rt.llm_enabled else "🤖 ИИ вкл", "adm:t:llm_enabled"),
         ],
+        [btn(
+            "🪄 Черновик по кнопке" if rt.auto_draft else "🪄 Черновик сразу",
+            "adm:t:auto_draft",
+        )],
         [btn("📊 Статистика", "adm:stats"), btn("⚙️ Параметры", "adm:params")],
         [btn("🔄 Обновить", "adm:menu")],
     ])

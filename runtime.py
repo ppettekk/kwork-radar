@@ -27,6 +27,10 @@ class Field:
 FIELDS: dict[str, Field] = {
     "paused": Field("bool", "Пауза", "опрос биржи остановлен"),
     "llm_enabled": Field("bool", "Черновики ИИ", "генерировать отклики"),
+    "auto_draft": Field(
+        "bool", "Черновик сразу",
+        "включено: приходит вместе с проектом; выключено: по кнопке",
+    ),
     "max_offers": Field(
         "int", "Максимум откликов", "у проекта, 0 и больше",
         minimum=0, steps=(-1, 1), presets=("1", "3", "5", "10"),
@@ -137,6 +141,7 @@ class Runtime:
         self._base: dict[str, Any] = {
             "paused": False,
             "llm_enabled": settings.llm_enabled,
+            "auto_draft": settings.auto_draft,
             "max_offers": settings.max_offers,
             "min_price": settings.min_price,
             "max_price": settings.max_price,

@@ -67,6 +67,7 @@ class Settings:
     llm_enabled: bool = field(default_factory=lambda: _bool("LLM_ENABLED", True))
     repair_dashes: bool = field(default_factory=lambda: _bool("REPAIR_DASHES", True))
     greeting: str = field(default_factory=lambda: _str("GREETING", "Здравствуйте!"))
+    auto_draft: bool = field(default_factory=lambda: _bool("AUTO_DRAFT", False))
 
     # --- Фильтры ---
     categories: list[int | str] = field(default_factory=lambda: _int_list("CATEGORIES"))
